@@ -32,8 +32,10 @@ returns a new `MapSliceOp` with a new parent operator, built from `trafo` adapte
 same `dim`, `size1`, `size2` and `T`, so it applies the same operation as `op` at the time of the call.
 `trafo` can be an array, which is adapted like the inputs of `SensitivityOp`, or an operator with an Adapt
 rule such as the operators of LinearOperatorCollection; `to` is passed to these rules as given. If `trafo` is
-or contains an operator that adapting does not rebuild, e.g. a `LinearOperator` built from functions, `adapt`
-throws an `ArgumentError`, so the new operator never shares an operator and its workspaces with `op`. Adapt changes the backend, not
+or contains an operator without such a rule, e.g. a `LinearOperator` built from functions, `adapt` throws an
+`ArgumentError`. Contained operators are the children of `ProdOp`, `DiagOp`, `MapSliceOp` and adjoints; other
+operators are rebuilt by their own rules. If the result still contains an operator of `trafo`, which would share its
+workspaces with `op`, `adapt` throws an `ArgumentError`. Adapt changes the backend, not
 the element type: targets that change the element type of `trafo` or of the storage throw an `ArgumentError`.
 `copy(op)` returns a new `MapSliceOp` with a copy of `trafo`: an operator with an Adapt rule is rebuilt by
 that rule on its backend from copies of its arrays. Operators without an Adapt rule, also inside `trafo`, are
@@ -66,34 +68,41 @@ function checkMapSliceSource(op::MapSliceOp{T}) where T
   return S
 end
 
-# Operators reachable from `x` through fields, elements of arrays and variables captured by closures.
-function reachableOperators(x, found = Base.IdSet{Any}(), visited = Base.IdSet{Any}())
-  (isbits(x) || x isa Union{Module, Type, Symbol, AbstractString} || x in visited) && return found
-  push!(visited, x)
-  x isa AbstractLinearOperator && push!(found, x)
-  if x isa AbstractArray
-    isbitstype(eltype(x)) || foreach(i -> isassigned(x, i) && reachableOperators(x[i], found, visited), eachindex(x))
-  else
-    foreach(i -> isdefined(x, i) && reachableOperators(getfield(x, i), found, visited), 1:nfields(x))
-  end
+# The operators that compute `op`: `op` and, recursively, the children of the composites below.
+operatorChildren(op) = ()
+operatorChildren(op::ProdOp) = (getfield(op, :A), getfield(op, :B))
+operatorChildren(op::DiagOp) = Tuple(getfield(op, :ops))
+operatorChildren(op::Union{LinearOperators.AdjointLinearOperator, LinearOperators.TransposeLinearOperator,
+                           LinearOperators.ConjugateLinearOperator}) = (op.parent,)
+operatorChildren(op::MapSliceOp) = getfield(op, :trafo) isa AbstractArray ? () : (getfield(op, :trafo),)
+function operatorTree(op, found = Base.IdSet{Any}())
+  op in found && return found
+  push!(found, op)
+  foreach(child -> operatorTree(child, found), operatorChildren(op))
   return found
 end
 
-# A transformation that still contains an operator of the source would share its workspaces with it.
+# Whether `adapt(to, op)` uses a rule rather than Adapt's fallback, which returns `op` unchanged.
+isAdaptFallback(f, to, op) = which(f, Tuple{Core.Typeof(to), typeof(op)}) === which(f, Tuple{Any, Any})
+hasAdaptRule(to, op) = !(isAdaptFallback(Adapt.adapt_structure, to, op) && isAdaptFallback(Adapt.adapt_storage, to, op))
+
+# A result that still contains an operator of the source would share its workspaces with it.
 function checkRebuilt(moved, trafo, verb)
-  sourceOps = reachableOperators(trafo)
-  for op in reachableOperators(moved)
-    op in sourceOps && throw(ArgumentError("cannot $verb MapSliceOp: its transformation contains an operator of type $(typeof(op)) " *
-                                           "that is not rebuilt, e.g. one without an Adapt rule, and would be shared with the source"))
+  source = operatorTree(trafo)
+  for op in operatorTree(moved)
+    op in source && throw(ArgumentError("cannot $verb MapSliceOp: the new transformation still contains the operator of type " *
+                                        "$(typeof(op)) of the source, which would be shared"))
   end
   return moved
 end
 
 adaptMapSliceChild(to, trafo::AbstractArray) = adaptRetained(to, trafo, "MapSliceOp transformation")
 function adaptMapSliceChild(to, trafo)
-  moved = adapt(to, trafo)
-  moved === trafo && throw(ArgumentError("cannot adapt MapSliceOp: its transformation of type $(typeof(trafo)) has no Adapt rule"))
-  return checkRebuilt(moved, trafo, "adapt")
+  for op in operatorTree(trafo)
+    hasAdaptRule(to, op) || throw(ArgumentError("cannot adapt MapSliceOp: its transformation is or contains an operator of type " *
+                                                "$(typeof(op)) that has no Adapt rule"))
+  end
+  return checkRebuilt(adapt(to, trafo), trafo, "adapt")
 end
 
 # Adapts to the backend `to` and copies the arrays that are already on it, so Adapt rules rebuild an operator

@@ -33,6 +33,18 @@ end
 Adapt.adapt_storage(a::RejectWeighting, x::AbstractArray) = adapt(a.to, x)
 Adapt.adapt_structure(::RejectWeighting, ::WeightingOp) = throw(ArgumentError("unsupported WeightingOp target"))
 
+# A wrapper whose metadata captures an operator that it never applies.
+const LO = MRIOperators.LinearOperators
+struct MetadataOp{T, O, M} <: LO.AbstractLinearOperator{T}
+  op::O
+  metadata::M
+end
+MetadataOp(op::LO.AbstractLinearOperator{T}, meta) where T = MetadataOp{T, typeof(op), typeof(meta)}(op, meta)
+Base.getproperty(x::MetadataOp, s::Symbol) = s in (:op, :metadata) ? getfield(x, s) : getproperty(getfield(x, :op), s)
+Base.setproperty!(x::MetadataOp, s::Symbol, v) = setproperty!(getfield(x, :op), s, v)
+LO.storage_type(x::MetadataOp) = LO.storage_type(getfield(x, :op))
+Adapt.adapt_structure(to, x::MetadataOp) = MetadataOp(adapt(to, getfield(x, :op)), getfield(x, :metadata))
+
 # Forward and adjoint results with three- and five-argument `mul!`, collected on the CPU.
 function adaptActions(op, conv, x, y)
   T = eltype(op)
@@ -310,17 +322,27 @@ end
     @test getfield(copied, :trafo).A !== weighting && getfield(copied, :trafo).B !== opaque
     testLeafActions(copied, from, M, x, y)
     @test state() == before
-    # `adapt` cannot rebuild it: on the same backend MapSliceOp rejects sharing it, on another backend
-    # ProdOp already rejects its storage
-    err = caught(() -> adapt(from, src))
-    @test err isa ArgumentError && occursin("cannot adapt", err.msg) && occursin("LinearOperator", err.msg)
-    from === to || @test caught(() -> adapt(to, src)) isa Exception
-    # The given adaptor's own rule for a child applies
-    err = caught(() -> adapt(RejectWeighting(to), MapSliceOp(weighting, 1, (3, 2), (3, 2); T)))
-    @test err isa ArgumentError && err.msg == "unsupported WeightingOp target"
-    err = caught(() -> adapt(RejectWeighting(to), src))
-    @test err isa ArgumentError && err.msg == "unsupported WeightingOp target"
+    for dest in unique((from, to)) # `adapt` cannot move it, also on the same backend
+      err = caught(() -> adapt(dest, src))
+      @test err isa ArgumentError && occursin("cannot adapt", err.msg) && occursin("no Adapt rule", err.msg) && occursin("LinearOperator", err.msg)
+    end
+    # The given adaptor's own rule for a child applies, also inside a composite
+    for child in (weighting, ProdOp(WeightingOp(from(T[1, 1im, 2]), 1), weighting))
+      err = caught(() -> adapt(RejectWeighting(to), MapSliceOp(child, 1, (3, 2), (3, 2); T)))
+      @test err isa ArgumentError && err.msg == "unsupported WeightingOp target"
+    end
     @test state() == before
+    # Operators that a child holds but does not apply are not inspected
+    aux = WeightingOp(from(T[2, 2, 2]), 1)
+    meta = let ref = aux; () -> ref; end
+    src = MapSliceOp(MetadataOp(weighting, meta), 1, (3, 2), (3, 2); T)
+    auxBefore = workspaceState(aux)
+    M = mapSliceDense(Diagonal(w), 1, (3, 2))
+    for (moved, dest) in ((adapt(to, src), to), (copy(src), from))
+      @test getfield(moved, :trafo) isa MetadataOp && getfield(getfield(moved, :trafo), :op) !== weighting
+      testLeafActions(moved, dest, M, x, y)
+    end
+    @test workspaceState(aux) == auxBefore
     src = MapSliceOp(ProdOp(weighting, adjoint(opaque)), 1, (3, 2), (3, 2); T)
     before = state()
     err = caught(() -> copy(src))
