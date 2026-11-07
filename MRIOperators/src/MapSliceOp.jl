@@ -31,10 +31,9 @@ generates an operator that applies `trafo` to each slice of dimension `dim` of a
 returns a new `MapSliceOp` with a new parent operator, built from `trafo` adapted to the target and the
 same `dim`, `size1`, `size2` and `T`, so it applies the same operation as `op` at the time of the call.
 `trafo` can be an array, which is adapted like the inputs of `SensitivityOp`, or an operator with an Adapt
-rule such as the operators of LinearOperatorCollection. Arrays of an operator `trafo` that Adapt returns
-unchanged, e.g. on the same backend, are copied, so the new operator has its own arrays and workspaces. If
-`trafo` is or contains an operator without such a rule, e.g. a `LinearOperator` built from functions, `adapt`
-throws an `ArgumentError`. Adapt changes the backend, not
+rule such as the operators of LinearOperatorCollection; `to` is passed to these rules as given. If `trafo` is
+or contains an operator that adapting does not rebuild, e.g. a `LinearOperator` built from functions, `adapt`
+throws an `ArgumentError`, so the new operator never shares an operator and its workspaces with `op`. Adapt changes the backend, not
 the element type: targets that change the element type of `trafo` or of the storage throw an `ArgumentError`.
 `copy(op)` returns a new `MapSliceOp` with a copy of `trafo`: an operator with an Adapt rule is rebuilt by
 that rule on its backend from copies of its arrays. Operators without an Adapt rule, also inside `trafo`, are
@@ -67,31 +66,51 @@ function checkMapSliceSource(op::MapSliceOp{T}) where T
   return S
 end
 
-# Moves an operator transformation with `to` and gives it its own arrays and workspaces: arrays that Adapt
-# returns unchanged are copied. Operators reach `adapt_storage` only if they have no Adapt rule, also inside a
-# composite such as `ProdOp`; `copy` copies them with their `copy` method, `adapt` cannot move them.
-struct MapSliceChildAdaptor{A}
-  to::A
-  copying::Bool
+# Operators reachable from `x` through fields, elements of arrays and variables captured by closures.
+function reachableOperators(x, found = Base.IdSet{Any}(), visited = Base.IdSet{Any}())
+  (isbits(x) || x isa Union{Module, Type, Symbol, AbstractString} || x in visited) && return found
+  push!(visited, x)
+  x isa AbstractLinearOperator && push!(found, x)
+  if x isa AbstractArray
+    isbitstype(eltype(x)) || foreach(i -> isassigned(x, i) && reachableOperators(x[i], found, visited), eachindex(x))
+  else
+    foreach(i -> isdefined(x, i) && reachableOperators(getfield(x, i), found, visited), 1:nfields(x))
+  end
+  return found
 end
-Adapt.adapt_storage(a::MapSliceChildAdaptor, x::AbstractArray) = (y = adapt(a.to, x); y === x ? copy(x) : y)
-function Adapt.adapt_storage(a::MapSliceChildAdaptor, op::AbstractLinearOperator)
-  a.copying && hasmethod(copy, Tuple{typeof(op)}) && return copy(op)
-  throw(ArgumentError("cannot $(a.copying ? "copy" : "adapt") MapSliceOp: its transformation is or contains an operator of type " *
-                      "$(typeof(op)) that has no Adapt rule$(a.copying ? " and no `copy` method" : "")"))
+
+# A transformation that still contains an operator of the source would share its workspaces with it.
+function checkRebuilt(moved, trafo, verb)
+  sourceOps = reachableOperators(trafo)
+  for op in reachableOperators(moved)
+    op in sourceOps && throw(ArgumentError("cannot $verb MapSliceOp: its transformation contains an operator of type $(typeof(op)) " *
+                                           "that is not rebuilt, e.g. one without an Adapt rule, and would be shared with the source"))
+  end
+  return moved
 end
 
 adaptMapSliceChild(to, trafo::AbstractArray) = adaptRetained(to, trafo, "MapSliceOp transformation")
 function adaptMapSliceChild(to, trafo)
-  moved = adapt(MapSliceChildAdaptor(to, false), trafo)
+  moved = adapt(to, trafo)
   moved === trafo && throw(ArgumentError("cannot adapt MapSliceOp: its transformation of type $(typeof(trafo)) has no Adapt rule"))
-  return moved
+  return checkRebuilt(moved, trafo, "adapt")
 end
+
+# Adapts to the backend `to` and copies the arrays that are already on it, so Adapt rules rebuild an operator
+# with its own arrays and workspaces. Operators reach `adapt_storage` only if they have no Adapt rule, also
+# inside a composite such as `ProdOp`; they are copied with their `copy` method.
+struct MapSliceCopyAdaptor{A}
+  to::A
+end
+Adapt.adapt_storage(a::MapSliceCopyAdaptor, x::AbstractArray) = (y = adapt(a.to, x); y === x ? copy(x) : y)
+Adapt.adapt_storage(::MapSliceCopyAdaptor, op::AbstractLinearOperator) = hasmethod(copy, Tuple{typeof(op)}) ? copy(op) :
+  throw(ArgumentError("cannot copy MapSliceOp: its transformation is or contains an operator of type $(typeof(op)) that has no Adapt rule and no `copy` method"))
 
 copyMapSliceChild(trafo::AbstractArray) = copy(trafo)
 function copyMapSliceChild(trafo)
-  moved = adapt(MapSliceChildAdaptor(stripParameters(LinearOperators.storage_type(trafo)), true), trafo)
-  return moved === trafo ? copy(trafo) : moved # neither an operator nor adaptable
+  moved = adapt(MapSliceCopyAdaptor(stripParameters(LinearOperators.storage_type(trafo))), trafo)
+  moved === trafo && return copy(trafo) # neither an operator nor adaptable
+  return checkRebuilt(moved, trafo, "copy")
 end
 
 function Base.copy(op::MapSliceOp{T}) where T
