@@ -18,6 +18,13 @@ IsbitsMatrix(a::AbstractMatrix) = IsbitsMatrix(Tuple(a), size(a, 1))
 Base.size(m::IsbitsMatrix{T, L}) where {T, L} = (m.rows, L ÷ m.rows)
 Base.getindex(m::IsbitsMatrix, i::Int, j::Int) = m.data[(j - 1) * m.rows + i]
 
+# An adaptor that counts its array conversions and delegates them to Adapt's rules for `to`.
+struct DelegatingAdaptor{A}
+  to::A
+  calls::Base.RefValue{Int}
+end
+Adapt.adapt_storage(a::DelegatingAdaptor, x::AbstractArray) = (a.calls[] += 1; adapt(a.to, x))
+
 # Forward and adjoint results with three- and five-argument `mul!`, collected on the CPU.
 function adaptActions(op, conv, x, y)
   T = eltype(op)
@@ -179,5 +186,269 @@ if arrayTypes == [Array]
       testSubspaceLeaf(moved, to)
       testAdaptActions(moved, to, ref, Array, adaptRtol(T))
     end
+  end
+end
+
+# MapSliceOp and ExplicitOp: actions are compared with dense references on the CPU.
+leafClose(a, b) = isapprox(a, b; rtol = 2e-4, atol = 1e-5)
+# Forward/adjoint references with three- and five-argument `mul!` in the order of `adaptActions`.
+function denseActions(M, x, y)
+  T = promote_type(eltype(M), eltype(x))
+  α, β = T(0.5), T(0.75)
+  return (M * x, α .* (M * x) .+ β .* y, M' * y, α .* (M' * y) .+ β .* x)
+end
+testLeafActions(op, conv, M, x, y) = foreach(((m, r),) -> @test(leafClose(m, r)), zip(adaptActions(op, conv, x, y), denseActions(M, x, y)))
+# Error raised by `f()`, or `nothing`.
+caught(f) = try f(); nothing catch e; e end
+vectorType(conv, T) = typeof(conv(T[]))
+
+# Dense matrix of applying `A` to the slices along `dim` of arrays of size `size1`.
+mapSliceDense(A, dim, size1) = kron(Matrix(I, prod(size1[dim+1:end]), prod(size1[dim+1:end])), Array(A),
+                                    Matrix(I, prod(size1[1:dim-1]), prod(size1[1:dim-1])))
+mapSliceState(op) = (workspaceState(parent(op)), Array(getfield(op, :trafo)))
+function mapSliceFixture(T, Tt, dim, layout)
+  A = testData(Tt, 2, 3) ./ 3
+  size1 = dim == 1 ? (layout == 2 ? (3, 2) : (3, 2, 2)) : (layout == 2 ? (2, 3) : (2, 3, 2))
+  size2 = Base.setindex(size1, 2, dim)
+  return A, size1, size2
+end
+
+@testset "Adapt MapSliceOp $(nameof(from)) -> $(nameof(to))" for (from, to) in adaptDirections
+  @testset "$T, trafo $Tt, dim=$dim, $(layout)D" for (T, Tt) in ((Float32, Float32), (ComplexF32, ComplexF32), (ComplexF32, Float32), (ComplexF64, Float32)),
+                                                     dim in (1, 2), layout in (2, 3)
+    A, size1, size2 = mapSliceFixture(T, Tt, dim, layout)
+    src = T == ComplexF64 ? MapSliceOp(from(A), dim, size1, size2) : MapSliceOp(from(A), dim, size1, size2; T)
+    @test eltype(src) == T && eltype(storageType(src)) == T && storageType(src) <: from
+    M = mapSliceDense(A, dim, size1)
+    x, y = testData(T, prod(size1)), testData(T, prod(size2)) .+ 1
+    testLeafActions(src, from, M, x, y)
+    before = mapSliceState(src)
+    for (moved, dest) in ((adapt(to, src), to), (copy(src), from))
+      testMovedWrapper(moved, src, dest)
+      @test onTarget(getfield(moved, :trafo), dest) && eltype(getfield(moved, :trafo)) == Tt
+      @test (getfield(moved, :dim), getfield(moved, :size1), getfield(moved, :size2)) == (dim, size1, size2)
+      testLeafActions(moved, dest, M, x, y)
+    end
+    @test mapSliceState(src) == before
+  end
+
+  @testset "Transformation changed before adapting" begin
+    T = ComplexF32
+    A, size1, size2 = mapSliceFixture(T, T, 2, 3)
+    trafo = from(copy(A))
+    src = MapSliceOp(trafo, 2, size1, size2; T)
+    trafo .*= 2 # the operation reads the live transformation
+    M = mapSliceDense(2 .* A, 2, size1)
+    x, y = testData(T, prod(size1)), testData(T, prod(size2)) .+ 1
+    testLeafActions(src, from, M, x, y)
+    moved, copied = adapt(to, src), copy(src)
+    before = mapSliceState(src)
+    testLeafActions(moved, to, M, x, y)
+    testLeafActions(copied, from, M, x, y)
+    @test mapSliceState(src) == before
+    trafo .*= 3
+    testLeafActions(copied, from, M, x, y)
+    from === to || testLeafActions(moved, to, M, x, y)
+  end
+
+  @testset "Operator transformation" begin
+    T = ComplexF32
+    child = SamplingOp(T; pattern = [1, 3], shape = (3,), S = vectorType(from, T))
+    src = MapSliceOp(child, 2, (2, 3, 2), (2, 2, 2); T)
+    M = mapSliceDense(Matrix{T}(I, 3, 3)[[1, 3], :], 2, (2, 3, 2))
+    x, y = testData(T, 12), testData(T, 8) .+ 1
+    testLeafActions(src, from, M, x, y)
+    moved = adapt(to, src)
+    testMovedWrapper(moved, src, to)
+    @test getfield(moved, :trafo) isa SamplingOp && getfield(moved, :trafo) !== child && storageType(getfield(moved, :trafo)) <: to
+    testLeafActions(moved, to, M, x, y)
+  end
+
+  @testset "Rejected sources and targets" begin
+    A, size1, size2 = mapSliceFixture(Float32, Float32, 1, 2)
+    for (src, needle) in ((MapSliceOp(LinearOperator(from(A)), 1, size1, size2; T = Float32, S = vectorType(from, Float32)), "no Adapt rule"),
+                          (MapSliceOp(from(A), 1, size1, size2; T = ComplexF32, S = vectorType(from, Float32)), "does not hold its element type"))
+      before = workspaceState(parent(src))
+      err = caught(() -> adapt(to, src))
+      @test err isa ArgumentError && occursin(needle, err.msg)
+      needle == "no Adapt rule" || (err = caught(() -> copy(src)); @test err isa ArgumentError && occursin(needle, err.msg))
+      @test workspaceState(parent(src)) == before
+    end
+    src = MapSliceOp(from(A), 1, size1, size2; T = Float32)
+    before = mapSliceState(src)
+    err = caught(() -> adapt(to{Float64}, src))
+    @test err isa ArgumentError && occursin("element type", err.msg)
+    @test mapSliceState(src) == before
+  end
+end
+
+# Dense explicit encoding matrix, evaluated in double precision.
+function explicitDense(shape, tr, cmap, echoOffset)
+  nodes, times = Float64.(kspaceNodes(tr)), Float64.(readoutTimes(tr))
+  idx = CartesianIndices(shape)
+  return [exp(-2im * pi * sum(nodes[d, k] * (idx[l][d] - shape[d] / 2 - 1) for d in 1:length(shape)) -
+              (times[k] - echoOffset) * ComplexF64(cmap[l])) for k in 1:size(nodes, 2), l in 1:prod(shape)]
+end
+explicitState(op) = (workspaceState(op), map(f -> Array(getfield(op, f)), (:nodes, :times, :disturbanceTerm)))
+explicitTrajectory(R, D) = D == 2 ? CartesianTrajectory(R, 3, 3; TE = R(0.001), AQ = R(0.004)) :
+                                   CartesianTrajectory3D(R, 3, 3; numSlices = 3, TE = R(0.001), AQ = R(0.004))
+explicitMap(T, shape) = reshape(T[complex(20 + 3k, 300 - 10k) for k in 1:prod(shape)], shape)
+function testExplicitLeaf(op, to, src)
+  @test op isa ExplicitOp && eltype(op) == eltype(src) && size(op) == size(src) && storageType(op) <: to
+  @test onTarget(getfield(op, :nodes), to) && eltype(getfield(op, :nodes)) == real(eltype(src))
+  @test onTarget(getfield(op, :times), to) && eltype(getfield(op, :times)) == real(eltype(src))
+  @test onTarget(getfield(op, :disturbanceTerm), to) && eltype(getfield(op, :disturbanceTerm)) == eltype(src)
+  @test getfield(op, :shape) == getfield(src, :shape) && getfield(op, :echoOffset) == getfield(src, :echoOffset)
+end
+
+@testset "Adapt ExplicitOp $(nameof(from)) -> $(nameof(to))" for (from, to) in adaptDirections
+  @testset "$T $(D)D echoImage=$echo map=$kind" for T in (ComplexF32, ComplexF64), D in (2, 3), echo in (false, true),
+                                                   kind in (:nonzero, :empty, :view, :isbits)
+    D == 3 && kind == :isbits && continue
+    shape = ntuple(_ -> 3, D)
+    tr = explicitTrajectory(real(T), D)
+    big = explicitMap(T, shape .+ 1)
+    cmap = kind == :nonzero ? from(explicitMap(T, shape)) : kind == :empty ? Array{T}(undef, ntuple(_ -> 0, D)) :
+           kind == :view ? view(big, ntuple(_ -> 2:4, D)...) : IsbitsMatrix(explicitMap(T, shape))
+    src = ExplicitOp(shape, tr, cmap; echoImage = echo, S = vectorType(from, T))
+    M = explicitDense(shape, tr, kind == :empty ? zeros(T, shape) : Array(cmap), echo ? echoTime(tr) : 0.0)
+    x, y = testData(T, prod(shape)), testData(T, size(M, 1)) .+ 1
+    testExplicitLeaf(src, from, src) # retained inputs are plain arrays of the storage backend
+    testLeafActions(src, from, M, x, y)
+    before = explicitState(src)
+    moved, copied = adapt(to, src), copy(src)
+    @test moved !== src && copied !== src
+    testExplicitLeaf(moved, to, src)
+    testExplicitLeaf(copied, from, src)
+    for (op, conv) in ((moved, to), (copied, from))
+      testLeafActions(op, conv, M, x, y)
+    end
+    for adj in (adapt(to, adjoint(src)), adjoint(moved))
+      @test adj isa MRIOperators.LinearOperators.AdjointLinearOperator && adj.parent isa ExplicitOp && adj.parent !== src
+      @test storageType(adj) <: to && adjoint(adj) === adj.parent
+      testLeafActions(adj, to, Matrix(M'), y, x)
+    end
+    @test explicitState(src) == before
+  end
+
+  @testset "Correction map changed before adapting" begin
+    T, shape = ComplexF32, (3, 3)
+    tr = explicitTrajectory(Float32, 2)
+    cmap = from(explicitMap(T, shape))
+    src = ExplicitOp(shape, tr, cmap; echoImage = true, S = vectorType(from, T))
+    cmap .*= 2 # the operation reads the live correction map
+    M = explicitDense(shape, tr, 2 .* explicitMap(T, shape), echoTime(tr))
+    x, y = testData(T, prod(shape)), testData(T, size(M, 1)) .+ 1
+    testLeafActions(src, from, M, x, y)
+    moved, copied = adapt(to, src), copy(src)
+    before = explicitState(src)
+    testLeafActions(moved, to, M, x, y)
+    testLeafActions(copied, from, M, x, y)
+    @test explicitState(src) == before
+    cmap .*= 3
+    testLeafActions(copied, from, M, x, y)
+    from === to || testLeafActions(moved, to, M, x, y)
+  end
+
+  @testset "Rejected targets and storage types" begin
+    tr = explicitTrajectory(Float32, 2)
+    src = ExplicitOp((3, 3), tr, from(explicitMap(ComplexF32, (3, 3))); S = vectorType(from, ComplexF32))
+    before = explicitState(src)
+    err = caught(() -> adapt(to{ComplexF64}, src))
+    @test err isa ArgumentError && occursin("element types", err.msg)
+    @test explicitState(src) == before
+    # The storage element type must match the trajectory's precision.
+    @test caught(() -> ExplicitOp((3, 3), tr, explicitMap(ComplexF32, (3, 3)); S = vectorType(from, ComplexF64))) isa TypeError
+  end
+
+  @testset "Graphs with MapSliceOp, SensitivityOp and adjoint(ExplicitOp)" begin
+    T = ComplexF32
+    numVox, numChan, K, numContr = 4, 2, 2, 3
+    Φ = MapSliceOp(from(testData(T, numContr, K)), 3, (numVox, numChan, K), (numVox, numChan, numContr); T)
+    P = ProdOp(Φ, SensitivityOp(from(testData(T, numVox, numChan)), K))
+    E = ExplicitOp((3, 3), explicitTrajectory(Float32, 2), from(explicitMap(T, (3, 3))); S = vectorType(from, T))
+    G = ProdOp(adjoint(E), WeightingOp(from(Float32[0.5 + k / 10 for k in 1:size(E, 1)])))
+    for src in (P, G)
+      refs = adaptActions(src, from)
+      before = src === P ? (mapSliceState(Φ), workspaceState(P)) : (explicitState(E), workspaceState(G))
+      moved = adapt(to, src)
+      @test storageType(moved) <: to && storageType(moved.A) <: to && storageType(moved.B) <: to
+      if src === P
+        @test moved.A isa MapSliceOp && moved.B isa SensitivityOp && onTarget(getfield(moved.A, :trafo), to)
+      else
+        @test moved.A isa MRIOperators.LinearOperators.AdjointLinearOperator && moved.A.parent isa ExplicitOp && moved.A.parent !== E
+        testExplicitLeaf(moved.A.parent, to, E)
+      end
+      foreach(((m, r),) -> @test(isapprox(m, r; rtol = 2e-4, atol = 1e-5)), zip(adaptActions(moved, to), refs))
+      @test (src === P ? (mapSliceState(Φ), workspaceState(P)) : (explicitState(E), workspaceState(G))) == before
+    end
+  end
+
+  @testset "Custom adaptor" begin
+    T = ComplexF32
+    A, size1, size2 = mapSliceFixture(T, T, 2, 2)
+    src = MapSliceOp(from(A), 2, size1, size2; T)
+    E = ExplicitOp((3, 3), explicitTrajectory(Float32, 2), from(explicitMap(T, (3, 3))); S = vectorType(from, T))
+    calls = Ref(0)
+    adaptor = DelegatingAdaptor(to, calls)
+    moved, movedAdj = adapt(adaptor, src), adapt(adaptor, adjoint(E))
+    @test calls[] > 0
+    testMovedWrapper(moved, src, to)
+    @test onTarget(getfield(moved, :trafo), to)
+    @test movedAdj.parent !== E
+    testExplicitLeaf(movedAdj.parent, to, E)
+    for (m, s) in ((moved, src), (movedAdj, adjoint(E)))
+      foreach(((a, r),) -> @test(isapprox(a, r; rtol = 2e-4, atol = 1e-5)), zip(adaptActions(m, to), adaptActions(s, from)))
+    end
+  end
+end
+
+@testset "Explicit Fourier encoding factory $(nameof(from)) -> $(nameof(to))" for (from, to) in adaptDirections
+  T = ComplexF32
+  for D in (2, 3)
+    shape = ntuple(_ -> 3, D)
+    tr = explicitTrajectory(Float32, D)
+    cmap = explicitMap(T, D == 2 ? (shape..., 2) : shape)
+    S = vectorType(from, T)
+    subsampleIdx = [1, 2, 4, 6, 7]
+    for (op, map, rows) in ((fourierEncodingOp(shape, tr, "explicit"; correctionMap = cmap, slice = D == 2 ? 2 : 1, S), D == 2 ? cmap[:, :, 2] : cmap, :),
+                            (fourierEncodingOp(shape, tr, "explicit"; S), zeros(T, shape), :),
+                            (fourierEncodingOp(shape, tr, "explicit"; subsampleIdx, S), zeros(T, shape), subsampleIdx))
+      M = explicitDense(shape, tr, map, echoTime(tr))[rows, :]
+      x, y = testData(T, prod(shape)), testData(T, size(M, 1)) .+ 1
+      @test storageType(op) <: from
+      testLeafActions(op, from, M, x, y)
+      moved = adapt(to, op)
+      @test storageType(moved) <: to
+      testLeafActions(moved, to, M, x, y)
+    end
+  end
+end
+
+if arrayTypes == [Array]
+  @testset "Low-rank encoding operator" begin
+    shape, numContr, K = (4, 4), 3, 2
+    N = prod(shape)
+    tr = CartesianTrajectory(Float64, 4, 4)
+    idx = [[1, 2, 5, 7, 8, 11, 12, 16], [2, 3, 4, 6, 9, 10, 13, 15], [1, 3, 6, 8, 10, 12, 14, 16]]
+    kdata = Array{Matrix{ComplexF64}, 3}(undef, numContr, 1, 1)
+    for c in 1:numContr; kdata[c, 1, 1] = zeros(ComplexF64, length(idx[c]), 1); end
+    acqData = AcquisitionData(tr, kdata; idx, encodingSize = shape)
+    phi = reshape(testData(ComplexF64, numContr, K), numContr, K, 1)
+    E = lrEncodingOp(acqData, shape, Dict{Symbol, Any}(:phi => phi); numContr)
+    Φ = E.B.A
+    @test Φ isa MapSliceOp && getfield(Φ, :dim) == 2 && eltype(Φ) == ComplexF64 && storageType(Φ) == Vector{ComplexF64}
+    @test (getfield(Φ, :size1), getfield(Φ, :size2)) == ((N, K, 1), (N, numContr, 1))
+    ft = fourierEncodingOp(shape, tr, "fast")
+    F = reduce(hcat, [ft * Vector{ComplexF64}(1:N .== j) for j in 1:N])
+    x = testData(ComplexF64, N * K)
+    Z = reduce(hcat, [F * x[(k - 1) * N + 1:k * N] for k in 1:K]) # images transformed per basis component
+    Y = Z * transpose(phi[:, :, 1])                                # contrasts
+    ref = reduce(vcat, [Y[idx[c], c] for c in 1:numContr])
+    @test size(E) == (length(ref), N * K)
+    @test leafClose(E * x, ref)
+    composed = SamplingOp(ComplexF64; pattern = hcat(idx...), shape = (N, numContr, 1)) ∘ (MapSliceOp(phi[:, :, 1], 2, (N, K, 1), (N, numContr, 1)) ∘ DiagOp(ft, ft))
+    @test leafClose(composed * x, ref)
+    @test leafClose(E' * ref, composed' * ref)
   end
 end

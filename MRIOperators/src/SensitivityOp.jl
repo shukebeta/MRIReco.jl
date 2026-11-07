@@ -48,7 +48,8 @@ time of the call. In particular, the adjoint keeps using the conjugated maps com
 Maps that Adapt does not return as plain arrays of the target (views, structured or static matrices)
 are copied into plain arrays on the target. On the same backend, plain arrays may be shared with `op`
 and are only read. `op` itself is not modified.
-`SensitivityOp` and `SubspaceOp` are the MRI operators that support `Adapt.adapt` so far.
+`SensitivityOp`, `SubspaceOp`, `MapSliceOp` and `ExplicitOp` (also as `adjoint`) are the MRI operators
+that support `Adapt.adapt` so far.
 """
 struct SensitivityOp{T, O} <: WrappedMRIOperator{T, O}
   op::O

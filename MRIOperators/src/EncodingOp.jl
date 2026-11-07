@@ -146,6 +146,8 @@ function fourierEncodingOp(shape::NTuple{D,Int64}, tr::Trajectory{T}, opName::St
   # extract proper portion of correctionMap
   if !isempty(correctionMap)
     cmap = ( D==2 ? correctionMap[:,:,slice] : correctionMap )
+  else
+    cmap = Array{Complex{T}}(undef, ntuple(_ -> 0, D))
   end
   # Fourier transformations
   if opName=="explicit"
