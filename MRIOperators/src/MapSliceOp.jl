@@ -34,7 +34,9 @@ same `dim`, `size1`, `size2` and `T`, so it applies the same operation as `op` a
 rule such as the operators of LinearOperatorCollection. For an operator without such a rule, e.g. a
 `LinearOperator` built from functions, `adapt` throws an `ArgumentError`. Adapt changes the backend, not
 the element type: targets that change the element type of `trafo` or of the storage throw an `ArgumentError`.
-`copy(op)` returns a new `MapSliceOp` with `copy(trafo)`. `op` itself is not modified.
+`copy(op)` returns a new `MapSliceOp` with a copy of `trafo`: an operator with an Adapt rule is rebuilt by
+that rule on its backend from copies of its arrays, other operators are copied with `copy`. `op` itself is
+not modified.
 `SensitivityOp`, `SubspaceOp`, `MapSliceOp` and `ExplicitOp` (also as `adjoint`) are the MRI operators
 that support `Adapt.adapt` so far.
 """
@@ -62,16 +64,29 @@ function checkMapSliceSource(op::MapSliceOp{T}) where T
   return S
 end
 
-function Base.copy(op::MapSliceOp{T}) where T
-  S = checkMapSliceSource(op)
-  return MapSliceOp(copy(getfield(op, :trafo)), getfield(op, :dim), getfield(op, :size1), getfield(op, :size2); T, S)
-end
-
 adaptMapSliceChild(to, trafo::AbstractArray) = adaptRetained(to, trafo, "MapSliceOp transformation")
 function adaptMapSliceChild(to, trafo)
   moved = adapt(to, trafo)
   moved === trafo && throw(ArgumentError("cannot adapt MapSliceOp: its transformation of type $(typeof(trafo)) has no Adapt rule"))
   return moved
+end
+
+# Adapts to the backend `to` and copies the arrays that are already on it, so Adapt rules rebuild an operator
+# with its own arrays and workspaces.
+struct CopyingAdaptor{A}
+  to::A
+end
+Adapt.adapt_storage(a::CopyingAdaptor, x::AbstractArray) = (y = adapt(a.to, x); y === x ? copy(x) : y)
+
+copyMapSliceChild(trafo::AbstractArray) = copy(trafo)
+function copyMapSliceChild(trafo)
+  moved = adapt(CopyingAdaptor(stripParameters(LinearOperators.storage_type(trafo))), trafo)
+  return moved === trafo ? copy(trafo) : moved # no Adapt rule
+end
+
+function Base.copy(op::MapSliceOp{T}) where T
+  S = checkMapSliceSource(op)
+  return MapSliceOp(copyMapSliceChild(getfield(op, :trafo)), getfield(op, :dim), getfield(op, :size1), getfield(op, :size2); T, S)
 end
 
 function Adapt.adapt_structure(to, op::MapSliceOp{T}) where T

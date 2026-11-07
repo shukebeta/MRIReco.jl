@@ -85,21 +85,6 @@ workspaceState(op) = (Array(op.Mv), Array(op.Mtu), op.nprod, op.ntprod, op.nctpr
     testAdaptActions(moved, to, src, from, rtol)
   end
 
-  @testset "Copy wrappers $T" for T in (ComplexF32, ComplexF64)
-    shape, numContr = (3, 2), 3
-    for (src, retained) in ((SensitivityOp(from(testData(T, prod(shape), 2)), numContr), (:sensMaps, :sensMapsC)),
-                            (SubspaceOp(from(testData(T, numContr, 2)), shape, numContr), (:basis,)))
-      refs = adaptActions(src, from)
-      before = (workspaceState(parent(src)), map(f -> Array(getfield(src, f)), retained))
-      c = copy(src)
-      testMovedWrapper(c, src, from)
-      @test storageType(c) == storageType(src)
-      @test all(f -> getfield(c, f) !== getfield(src, f) && getfield(c, f) == getfield(src, f), retained)
-      foreach(((a, r),) -> @test(isapprox(a, r; rtol = adaptRtol(T))), zip(adaptActions(c, from), refs))
-      @test (workspaceState(parent(src)), map(f -> Array(getfield(src, f)), retained)) == before
-    end
-  end
-
   @testset "Nested product and source workspaces $T" for T in (ComplexF32, ComplexF64)
     shape, numContr = (2, 2, 2), 3
     maps, basis = from(testData(T, prod(shape), 2)), from(testData(T, numContr, 2))
@@ -230,6 +215,26 @@ function mapSliceFixture(T, Tt, dim, layout)
   return A, size1, size2
 end
 
+# Adapts and copies a MapSliceOp with operator transformation `child(src)`; `leaves(child)` are its retained arrays.
+function testOperatorChild(src, from, to, M, leaves; child = op -> getfield(op, :trafo))
+  x, y = testData(eltype(src), size(src, 2)), testData(eltype(src), size(src, 1)) .+ 1
+  testLeafActions(src, from, M, x, y)
+  inner(c) = c isa MRIOperators.LinearOperators.AdjointLinearOperator ? c.parent : c
+  state(op) = (workspaceState(parent(op)), workspaceState(inner(child(op))), map(Array, leaves(child(op))))
+  before = state(src)
+  moved, copied = adapt(to, src), copy(src)
+  for (op, dest) in ((moved, to), (copied, from))
+    testMovedWrapper(op, src, dest)
+    @test typeof(child(op)).name.wrapper === typeof(child(src)).name.wrapper && child(op) !== child(src)
+    @test all(l -> onTarget(l, dest), leaves(child(op))) && storageType(child(op)) <: dest
+    testLeafActions(op, dest, M, x, y)
+  end
+  @test state(src) == before
+  @test all(((a, b),) -> a !== b, zip(leaves(child(copied)), leaves(child(src))))
+  foreach(l -> l .*= 2, leaves(child(src))) # the copy keeps the arrays it was made from
+  testLeafActions(copied, from, M, x, y)
+end
+
 @testset "Adapt MapSliceOp $(nameof(from)) -> $(nameof(to))" for (from, to) in adaptDirections
   @testset "$T, trafo $Tt, dim=$dim, $(layout)D" for (T, Tt) in ((Float32, Float32), (ComplexF32, ComplexF32), (ComplexF32, Float32), (ComplexF64, Float32)),
                                                      dim in (1, 2), layout in (2, 3)
@@ -279,21 +284,13 @@ end
     testMovedWrapper(moved, src, to)
     @test getfield(moved, :trafo) isa SamplingOp && getfield(moved, :trafo) !== child && storageType(getfield(moved, :trafo)) <: to
     testLeafActions(moved, to, M, x, y)
-    # An MRI operator child is rebuilt with its own maps and workspaces by `adapt` and `copy`
-    maps = testData(T, 3, 2)
-    child = SensitivityOp(from(maps), 1)
-    src = MapSliceOp(child, 1, (3, 2), (6, 2); T)
-    M = mapSliceDense(reduce(vcat, [Diagonal(maps[:, c]) for c in 1:2]), 1, (3, 2))
-    x, y = testData(T, 6), testData(T, 12) .+ 1
-    testLeafActions(src, from, M, x, y)
-    before = (workspaceState(parent(src)), workspaceState(parent(child)))
-    for (moved, dest) in ((adapt(to, src), to), (copy(src), from))
-      testMovedWrapper(moved, src, dest)
-      @test getfield(moved, :trafo) isa SensitivityOp && parent(getfield(moved, :trafo)) !== parent(child)
-      testSensitivityLeaves(getfield(moved, :trafo), dest)
-      testLeafActions(moved, dest, M, x, y)
+    # Operator children with an Adapt rule but no `copy` method are rebuilt with their own arrays and workspaces
+    maps, w = testData(T, 3, 2), T[0.5, 1.5 - 1im, 2.5im]
+    for (child, A, size2, retained) in ((SensitivityOp(from(maps), 1), reduce(vcat, [Diagonal(maps[:, c]) for c in 1:2]), (6, 2), (:sensMaps, :sensMapsC)),
+                                        (WeightingOp(from(w), 1), Diagonal(w), (3, 2), (:weights,)))
+      testOperatorChild(MapSliceOp(child, 1, (3, 2), size2; T), from, to, mapSliceDense(A, 1, (3, 2)),
+                        op -> map(f -> getfield(op, f), retained))
     end
-    @test (workspaceState(parent(src)), workspaceState(parent(child))) == before
   end
 
   @testset "Rejected sources and targets" begin
@@ -414,6 +411,15 @@ end
       foreach(((m, r),) -> @test(isapprox(m, r; rtol = 2e-4, atol = 1e-5)), zip(adaptActions(moved, to), refs))
       @test (src === P ? (mapSliceState(Φ), workspaceState(P)) : (explicitState(E), workspaceState(G))) == before
     end
+  end
+
+  @testset "Adjoint ExplicitOp as MapSliceOp transformation" begin
+    T = ComplexF32
+    tr, cmap = explicitTrajectory(Float32, 2), explicitMap(T, (3, 3))
+    E = ExplicitOp((3, 3), tr, from(cmap); S = vectorType(from, T))
+    M = mapSliceDense(explicitDense((3, 3), tr, cmap, getfield(E, :echoOffset))', 1, (size(E, 1), 2))
+    testOperatorChild(MapSliceOp(adjoint(E), 1, (size(E, 1), 2), (size(E, 2), 2); T), from, to, M,
+                      A -> map(f -> getfield(A.parent, f), (:nodes, :times, :disturbanceTerm)))
   end
 
   @testset "Custom adaptor" begin
