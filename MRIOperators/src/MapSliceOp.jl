@@ -35,7 +35,8 @@ rule such as the operators of LinearOperatorCollection. For an operator without 
 `LinearOperator` built from functions, `adapt` throws an `ArgumentError`. Adapt changes the backend, not
 the element type: targets that change the element type of `trafo` or of the storage throw an `ArgumentError`.
 `copy(op)` returns a new `MapSliceOp` with a copy of `trafo`: an operator with an Adapt rule is rebuilt by
-that rule on its backend from copies of its arrays, other operators are copied with `copy`. `op` itself is
+that rule on its backend from copies of its arrays. Operators without an Adapt rule, also inside `trafo`, are
+copied with `copy`; if one of them has no `copy` method, `copy(op)` throws an `ArgumentError`. `op` itself is
 not modified.
 `SensitivityOp`, `SubspaceOp`, `MapSliceOp` and `ExplicitOp` (also as `adjoint`) are the MRI operators
 that support `Adapt.adapt` so far.
@@ -72,11 +73,13 @@ function adaptMapSliceChild(to, trafo)
 end
 
 # Adapts to the backend `to` and copies the arrays that are already on it, so Adapt rules rebuild an operator
-# with its own arrays and workspaces.
+# with its own arrays and workspaces. Operators reach `adapt_storage` only if they have no Adapt rule.
 struct CopyingAdaptor{A}
   to::A
 end
 Adapt.adapt_storage(a::CopyingAdaptor, x::AbstractArray) = (y = adapt(a.to, x); y === x ? copy(x) : y)
+Adapt.adapt_storage(::CopyingAdaptor, op::AbstractLinearOperator) = hasmethod(copy, Tuple{typeof(op)}) ? copy(op) :
+  throw(ArgumentError("cannot copy MapSliceOp: its transformation contains an operator of type $(typeof(op)) without an Adapt rule or a `copy` method"))
 
 copyMapSliceChild(trafo::AbstractArray) = copy(trafo)
 function copyMapSliceChild(trafo)

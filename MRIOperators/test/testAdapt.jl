@@ -291,6 +291,24 @@ end
       testOperatorChild(MapSliceOp(child, 1, (3, 2), size2; T), from, to, mapSliceDense(A, 1, (3, 2)),
                         op -> map(f -> getfield(op, f), retained))
     end
+    # Inside a composite child, an operator without an Adapt rule is copied with `copy`, or rejected without one
+    f = (res, x) -> (res .= 2 .* x)
+    opaque = LinearOperator{T}(3, 3, false, false, f, nothing, f; S = vectorType(from, T))
+    weighting = WeightingOp(from(w), 1)
+    src = MapSliceOp(ProdOp(weighting, opaque), 1, (3, 2), (3, 2); T)
+    M = mapSliceDense(2 .* Diagonal(w), 1, (3, 2))
+    x, y = testData(T, 6), testData(T, 6) .+ 1
+    state() = (workspaceState(parent(src)), workspaceState(getfield(src, :trafo)), workspaceState(opaque), workspaceState(weighting), Array(getfield(weighting, :weights)))
+    before = state()
+    copied = copy(src)
+    @test getfield(copied, :trafo).A !== weighting && getfield(copied, :trafo).B !== opaque
+    testLeafActions(copied, from, M, x, y)
+    @test state() == before
+    src = MapSliceOp(ProdOp(weighting, adjoint(opaque)), 1, (3, 2), (3, 2); T)
+    before = state()
+    err = caught(() -> copy(src))
+    @test err isa ArgumentError && occursin("AdjointLinearOperator", err.msg)
+    @test state() == before
   end
 
   @testset "Rejected sources and targets" begin
