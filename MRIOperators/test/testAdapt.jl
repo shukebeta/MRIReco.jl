@@ -304,10 +304,15 @@ end
     @test getfield(copied, :trafo).A !== weighting && getfield(copied, :trafo).B !== opaque
     testLeafActions(copied, from, M, x, y)
     @test state() == before
+    for dest in unique((from, to)) # `adapt` cannot move it, also on the same backend
+      err = caught(() -> adapt(dest, src))
+      @test err isa ArgumentError && occursin("cannot adapt", err.msg) && occursin("LinearOperator", err.msg)
+    end
+    @test state() == before
     src = MapSliceOp(ProdOp(weighting, adjoint(opaque)), 1, (3, 2), (3, 2); T)
     before = state()
     err = caught(() -> copy(src))
-    @test err isa ArgumentError && occursin("AdjointLinearOperator", err.msg)
+    @test err isa ArgumentError && occursin("cannot copy", err.msg) && occursin("AdjointLinearOperator", err.msg)
     @test state() == before
   end
 
