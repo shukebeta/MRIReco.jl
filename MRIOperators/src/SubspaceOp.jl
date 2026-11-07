@@ -31,7 +31,8 @@ basis type should correspond to the type of the rawdata
 returns a new `SubspaceOp` with a new parent operator, built from the basis adapted to the target.
 Its storage type `S` is derived from the adapted basis. A basis that Adapt does not return as a plain
 array of the target (a view, structured or static matrix) is copied into a plain array on the target. On the same backend, a plain basis may be shared with
-`op` and is only read. `op` itself is not modified.
+`op` and is only read. `copy(op)` returns a new `SubspaceOp` with a copy of the basis and the storage type
+of `op`. `op` itself is not modified.
 `SensitivityOp`, `SubspaceOp`, `MapSliceOp` and `ExplicitOp` (also as `adjoint`) are the MRI operators
 that support `Adapt.adapt` so far.
 """
@@ -55,3 +56,5 @@ parent(op::SubspaceOp) = getfield(op, :op)
 
 Adapt.adapt_structure(to, op::SubspaceOp) =
   SubspaceOp(adaptRetained(to, getfield(op, :basis), "basis"), getfield(op, :shape), getfield(op, :numContr))
+Base.copy(op::SubspaceOp) =
+  SubspaceOp(copy(getfield(op, :basis)), getfield(op, :shape), getfield(op, :numContr), LinearOperators.storage_type(op))

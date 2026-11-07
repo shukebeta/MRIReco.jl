@@ -18,12 +18,14 @@ IsbitsMatrix(a::AbstractMatrix) = IsbitsMatrix(Tuple(a), size(a, 1))
 Base.size(m::IsbitsMatrix{T, L}) where {T, L} = (m.rows, L ÷ m.rows)
 Base.getindex(m::IsbitsMatrix, i::Int, j::Int) = m.data[(j - 1) * m.rows + i]
 
-# An adaptor that counts its array conversions and delegates them to Adapt's rules for `to`.
+# An adaptor that records the arrays it converts and delegates them to Adapt's rules for `to`.
 struct DelegatingAdaptor{A}
   to::A
-  calls::Base.RefValue{Int}
+  seen::Vector{Any}
 end
-Adapt.adapt_storage(a::DelegatingAdaptor, x::AbstractArray) = (a.calls[] += 1; adapt(a.to, x))
+DelegatingAdaptor(to) = DelegatingAdaptor(to, Any[])
+Adapt.adapt_storage(a::DelegatingAdaptor, x::AbstractArray) = (push!(a.seen, x); adapt(a.to, x))
+reached(a::DelegatingAdaptor, x) = any(y -> y === x, a.seen)
 
 # Forward and adjoint results with three- and five-argument `mul!`, collected on the CPU.
 function adaptActions(op, conv, x, y)
@@ -81,6 +83,21 @@ workspaceState(op) = (Array(op.Mv), Array(op.Mtu), op.nprod, op.ntprod, op.nctpr
     testSubspaceLeaf(moved, to)
     @test getfield(moved, :shape) == shape && getfield(moved, :numContr) == numContr
     testAdaptActions(moved, to, src, from, rtol)
+  end
+
+  @testset "Copy wrappers $T" for T in (ComplexF32, ComplexF64)
+    shape, numContr = (3, 2), 3
+    for (src, retained) in ((SensitivityOp(from(testData(T, prod(shape), 2)), numContr), (:sensMaps, :sensMapsC)),
+                            (SubspaceOp(from(testData(T, numContr, 2)), shape, numContr), (:basis,)))
+      refs = adaptActions(src, from)
+      before = (workspaceState(parent(src)), map(f -> Array(getfield(src, f)), retained))
+      c = copy(src)
+      testMovedWrapper(c, src, from)
+      @test storageType(c) == storageType(src)
+      @test all(f -> getfield(c, f) !== getfield(src, f) && getfield(c, f) == getfield(src, f), retained)
+      foreach(((a, r),) -> @test(isapprox(a, r; rtol = adaptRtol(T))), zip(adaptActions(c, from), refs))
+      @test (workspaceState(parent(src)), map(f -> Array(getfield(src, f)), retained)) == before
+    end
   end
 
   @testset "Nested product and source workspaces $T" for T in (ComplexF32, ComplexF64)
@@ -262,6 +279,21 @@ end
     testMovedWrapper(moved, src, to)
     @test getfield(moved, :trafo) isa SamplingOp && getfield(moved, :trafo) !== child && storageType(getfield(moved, :trafo)) <: to
     testLeafActions(moved, to, M, x, y)
+    # An MRI operator child is rebuilt with its own maps and workspaces by `adapt` and `copy`
+    maps = testData(T, 3, 2)
+    child = SensitivityOp(from(maps), 1)
+    src = MapSliceOp(child, 1, (3, 2), (6, 2); T)
+    M = mapSliceDense(reduce(vcat, [Diagonal(maps[:, c]) for c in 1:2]), 1, (3, 2))
+    x, y = testData(T, 6), testData(T, 12) .+ 1
+    testLeafActions(src, from, M, x, y)
+    before = (workspaceState(parent(src)), workspaceState(parent(child)))
+    for (moved, dest) in ((adapt(to, src), to), (copy(src), from))
+      testMovedWrapper(moved, src, dest)
+      @test getfield(moved, :trafo) isa SensitivityOp && parent(getfield(moved, :trafo)) !== parent(child)
+      testSensitivityLeaves(getfield(moved, :trafo), dest)
+      testLeafActions(moved, dest, M, x, y)
+    end
+    @test (workspaceState(parent(src)), workspaceState(parent(child))) == before
   end
 
   @testset "Rejected sources and targets" begin
@@ -387,18 +419,19 @@ end
   @testset "Custom adaptor" begin
     T = ComplexF32
     A, size1, size2 = mapSliceFixture(T, T, 2, 2)
-    src = MapSliceOp(from(A), 2, size1, size2; T)
+    maps = from(testData(T, 3, 2))
+    sens = SensitivityOp(maps, 1)
     E = ExplicitOp((3, 3), explicitTrajectory(Float32, 2), from(explicitMap(T, (3, 3))); S = vectorType(from, T))
-    calls = Ref(0)
-    adaptor = DelegatingAdaptor(to, calls)
-    moved, movedAdj = adapt(adaptor, src), adapt(adaptor, adjoint(E))
-    @test calls[] > 0
-    testMovedWrapper(moved, src, to)
-    @test onTarget(getfield(moved, :trafo), to)
-    @test movedAdj.parent !== E
-    testExplicitLeaf(movedAdj.parent, to, E)
-    for (m, s) in ((moved, src), (movedAdj, adjoint(E)))
-      foreach(((a, r),) -> @test(isapprox(a, r; rtol = 2e-4, atol = 1e-5)), zip(adaptActions(m, to), adaptActions(s, from)))
+    for (src, retained) in ((MapSliceOp(from(A), 2, size1, size2; T), op -> (getfield(op, :trafo),)),
+                            (MapSliceOp(sens, 1, (3, 2), (6, 2); T), op -> (getfield(getfield(op, :trafo), :sensMaps), getfield(getfield(op, :trafo), :sensMapsC))),
+                            (adjoint(E), op -> map(f -> getfield(op.parent, f), (:nodes, :times, :disturbanceTerm))))
+      adaptor = DelegatingAdaptor(to)
+      moved = adapt(adaptor, src)
+      for x in retained(src) # each retained input is converted by the given adaptor
+        @test reached(adaptor, x)
+      end
+      @test all(x -> onTarget(x, to), retained(moved)) && storageType(moved) <: to
+      foreach(((a, r),) -> @test(isapprox(a, r; rtol = 2e-4, atol = 1e-5)), zip(adaptActions(moved, to), adaptActions(src, from)))
     end
   end
 end

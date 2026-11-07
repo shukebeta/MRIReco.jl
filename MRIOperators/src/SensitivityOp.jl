@@ -47,7 +47,8 @@ conjugates adapted to the target, so it applies the same forward and adjoint ope
 time of the call. In particular, the adjoint keeps using the conjugated maps computed when `op` was built.
 Maps that Adapt does not return as plain arrays of the target (views, structured or static matrices)
 are copied into plain arrays on the target. On the same backend, plain arrays may be shared with `op`
-and are only read. `op` itself is not modified.
+and are only read. `copy(op)` returns a new `SensitivityOp` with copies of both maps. `op` itself is
+not modified.
 `SensitivityOp`, `SubspaceOp`, `MapSliceOp` and `ExplicitOp` (also as `adjoint`) are the MRI operators
 that support `Adapt.adapt` so far.
 """
@@ -73,6 +74,8 @@ parent(op::SensitivityOp) = getfield(op, :op)
 Adapt.adapt_structure(to, op::SensitivityOp{T}) where T =
   SensitivityOp{T}(adaptRetained(to, getfield(op, :sensMaps), "sensMaps"),
                    adaptRetained(to, getfield(op, :sensMapsC), "conjugated sensMaps"), getfield(op, :numContr))
+Base.copy(op::SensitivityOp{T}) where T =
+  SensitivityOp{T}(copy(getfield(op, :sensMaps)), copy(getfield(op, :sensMapsC)), getfield(op, :numContr))
 
 """
   SensitivityOp(sensMaps::AbstractArray{T,4}, numContr=1)

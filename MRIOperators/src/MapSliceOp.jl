@@ -34,7 +34,7 @@ same `dim`, `size1`, `size2` and `T`, so it applies the same operation as `op` a
 rule such as the operators of LinearOperatorCollection. For an operator without such a rule, e.g. a
 `LinearOperator` built from functions, `adapt` throws an `ArgumentError`. Adapt changes the backend, not
 the element type: targets that change the element type of `trafo` or of the storage throw an `ArgumentError`.
-`copy(op)` returns a new `MapSliceOp` with a copy of `trafo`. `op` itself is not modified.
+`copy(op)` returns a new `MapSliceOp` with `copy(trafo)`. `op` itself is not modified.
 `SensitivityOp`, `SubspaceOp`, `MapSliceOp` and `ExplicitOp` (also as `adjoint`) are the MRI operators
 that support `Adapt.adapt` so far.
 """
