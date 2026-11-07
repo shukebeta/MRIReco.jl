@@ -32,6 +32,12 @@ struct RejectWeighting{A}
 end
 Adapt.adapt_storage(a::RejectWeighting, x::AbstractArray) = adapt(a.to, x)
 Adapt.adapt_structure(::RejectWeighting, ::WeightingOp) = throw(ArgumentError("unsupported WeightingOp target"))
+# An adaptor with its own rule for ProdOp, which copies the second factor.
+struct ProdAdaptor{A}
+  to::A
+end
+Adapt.adapt_storage(a::ProdAdaptor, x::AbstractArray) = adapt(a.to, x)
+Adapt.adapt_structure(a::ProdAdaptor, op::ProdOp) = ProdOp(adapt(a.to, op.A), copy(op.B))
 
 # A wrapper whose metadata captures an operator that it never applies.
 const LO = MRIOperators.LinearOperators
@@ -313,25 +319,45 @@ end
     f = (res, x) -> (res .= 2 .* x)
     opaque = LinearOperator{T}(3, 3, false, false, f, nothing, f; S = vectorType(from, T))
     weighting = WeightingOp(from(w), 1)
-    src = MapSliceOp(ProdOp(weighting, opaque), 1, (3, 2), (3, 2); T)
-    M = mapSliceDense(2 .* Diagonal(w), 1, (3, 2))
     x, y = testData(T, 6), testData(T, 6) .+ 1
-    state() = (workspaceState(parent(src)), workspaceState(getfield(src, :trafo)), workspaceState(opaque), workspaceState(weighting), Array(getfield(weighting, :weights)))
-    before = state()
-    copied = copy(src)
-    @test getfield(copied, :trafo).A !== weighting && getfield(copied, :trafo).B !== opaque
-    testLeafActions(copied, from, M, x, y)
-    @test state() == before
-    for dest in unique((from, to)) # `adapt` cannot move it, also on the same backend
-      err = caught(() -> adapt(dest, src))
-      @test err isa ArgumentError && occursin("cannot adapt", err.msg) && occursin("no Adapt rule", err.msg) && occursin("LinearOperator", err.msg)
+    state(src) = (workspaceState(parent(src)), workspaceState(getfield(src, :trafo)), workspaceState(opaque), workspaceState(weighting), Array(getfield(weighting, :weights)))
+    kids(c) = c isa ProdOp ? (c.A, c.B) : Tuple(getfield(c, :ops))
+    for (child, A) in ((ProdOp(weighting, opaque), 2 .* Diagonal(w)),
+                       (RowBlockOp([weighting, opaque]), vcat(Matrix(Diagonal(w)), Matrix{T}(2I, 3, 3))))
+      src = MapSliceOp(child, 1, (3, 2), (size(A, 1), 2); T)
+      M, y2 = mapSliceDense(A, 1, (3, 2)), testData(T, 2 * size(A, 1)) .+ 1
+      before = state(src)
+      copied = copy(src)
+      @test all(((c, s),) -> c !== s, zip(kids(getfield(copied, :trafo)), (weighting, opaque)))
+      testLeafActions(copied, from, M, x, y2)
+      @test state(src) == before
+      for dest in unique((from, to)) # `adapt` cannot move it, also on the same backend
+        err = caught(() -> adapt(dest, src))
+        @test err isa ArgumentError && occursin("cannot adapt", err.msg) && occursin("no Adapt rule", err.msg) && occursin("LinearOperator", err.msg)
+      end
+      @test state(src) == before
     end
+    # Array operands of a composite are only read and may be shared on the same backend
+    B = testData(T, 3, 3)
+    src = MapSliceOp(ProdOp(from(B), weighting), 1, (3, 2), (3, 2); T)
+    M = mapSliceDense(B * Diagonal(w), 1, (3, 2))
+    for (moved, dest) in ((adapt(from, src), from), (adapt(to, src), to), (copy(src), from))
+      @test getfield(moved, :trafo).B !== weighting
+      testLeafActions(moved, dest, M, x, y)
+    end
+    # The given adaptor's own rule for a composite decides how its children are rebuilt
+    src = MapSliceOp(ProdOp(weighting, opaque), 1, (3, 2), (3, 2); T)
+    before = state(src)
+    moved = adapt(ProdAdaptor(from), src)
+    @test getfield(moved, :trafo).A !== weighting && getfield(moved, :trafo).B !== opaque
+    testLeafActions(moved, from, mapSliceDense(2 .* Diagonal(w), 1, (3, 2)), x, y)
+    @test state(src) == before
     # The given adaptor's own rule for a child applies, also inside a composite
     for child in (weighting, ProdOp(WeightingOp(from(T[1, 1im, 2]), 1), weighting))
       err = caught(() -> adapt(RejectWeighting(to), MapSliceOp(child, 1, (3, 2), (3, 2); T)))
       @test err isa ArgumentError && err.msg == "unsupported WeightingOp target"
     end
-    @test state() == before
+    @test state(src) == before
     # Operators that a child holds but does not apply are not inspected
     aux = WeightingOp(from(T[2, 2, 2]), 1)
     meta = let ref = aux; () -> ref; end
@@ -344,10 +370,10 @@ end
     end
     @test workspaceState(aux) == auxBefore
     src = MapSliceOp(ProdOp(weighting, adjoint(opaque)), 1, (3, 2), (3, 2); T)
-    before = state()
+    before = state(src)
     err = caught(() -> copy(src))
     @test err isa ArgumentError && occursin("cannot copy", err.msg) && occursin("AdjointLinearOperator", err.msg)
-    @test state() == before
+    @test state(src) == before
   end
 
   @testset "Rejected sources and targets" begin

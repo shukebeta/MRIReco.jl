@@ -33,9 +33,10 @@ same `dim`, `size1`, `size2` and `T`, so it applies the same operation as `op` a
 `trafo` can be an array, which is adapted like the inputs of `SensitivityOp`, or an operator with an Adapt
 rule such as the operators of LinearOperatorCollection; `to` is passed to these rules as given. If `trafo` is
 or contains an operator without such a rule, e.g. a `LinearOperator` built from functions, `adapt` throws an
-`ArgumentError`. Contained operators are the children of `ProdOp`, `DiagOp`, `MapSliceOp` and adjoints; other
-operators are rebuilt by their own rules. If the result still contains an operator of `trafo`, which would share its
-workspaces with `op`, `adapt` throws an `ArgumentError`. Adapt changes the backend, not
+`ArgumentError`. Contained operators are the operator children of `ProdOp`, `DiagOp`, `RowBlockOp`, their normal
+operators, `MapSliceOp` and adjoints, except below an operator for which `to` has a rule of its own; other operators
+are rebuilt by their own rules. If the result still contains an operator of `trafo`, which would share its workspaces
+with `op`, `adapt` throws an `ArgumentError`. Array operands may be shared on the same backend; they are only read. Adapt changes the backend, not
 the element type: targets that change the element type of `trafo` or of the storage throw an `ArgumentError`.
 `copy(op)` returns a new `MapSliceOp` with a copy of `trafo`: an operator with an Adapt rule is rebuilt by
 that rule on its backend from copies of its arrays. Operators without an Adapt rule, also inside `trafo`, are
@@ -68,13 +69,26 @@ function checkMapSliceSource(op::MapSliceOp{T}) where T
   return S
 end
 
-# The operators that compute `op`: `op` and, recursively, the children of the composites below.
+# The operators that compute `op`: `op` and, recursively, the operator children of the composites below.
+# Array operands are only read and are not included.
+function childOperators(op, fields...)
+  children = Any[]
+  for f in fields
+    x = getfield(op, f)
+    xs = x isa Union{Tuple, AbstractVector} && !(x isa AbstractArray{<:Number}) ? x : (x,)
+    append!(children, Iterators.filter(c -> c isa AbstractLinearOperator, xs))
+  end
+  return children
+end
 operatorChildren(op) = ()
-operatorChildren(op::ProdOp) = (getfield(op, :A), getfield(op, :B))
-operatorChildren(op::DiagOp) = Tuple(getfield(op, :ops))
+operatorChildren(op::ProdOp) = childOperators(op, :A, :B)
+operatorChildren(op::Union{DiagOp, RowBlockOp}) = childOperators(op, :ops)
+operatorChildren(op::Union{LinearOperatorCollection.DiagNormalOp, LinearOperatorCollection.RowBlockNormalOp}) = childOperators(op, :normalOps)
+operatorChildren(op::LinearOperatorCollection.ProdNormalOp) = childOperators(op, :opOuter, :normalOpInner)
+operatorChildren(op::LinearOperatorCollection.NormalOpImpl) = childOperators(op, :parent, :weights)
 operatorChildren(op::Union{LinearOperators.AdjointLinearOperator, LinearOperators.TransposeLinearOperator,
-                           LinearOperators.ConjugateLinearOperator}) = (op.parent,)
-operatorChildren(op::MapSliceOp) = getfield(op, :trafo) isa AbstractArray ? () : (getfield(op, :trafo),)
+                           LinearOperators.ConjugateLinearOperator}) = childOperators(op, :parent)
+operatorChildren(op::MapSliceOp) = childOperators(op, :trafo)
 function operatorTree(op, found = Base.IdSet{Any}())
   op in found && return found
   push!(found, op)
@@ -85,6 +99,14 @@ end
 # Whether `adapt(to, op)` uses a rule rather than Adapt's fallback, which returns `op` unchanged.
 isAdaptFallback(f, to, op) = which(f, Tuple{Core.Typeof(to), typeof(op)}) === which(f, Tuple{Any, Any})
 hasAdaptRule(to, op) = !(isAdaptFallback(Adapt.adapt_structure, to, op) && isAdaptFallback(Adapt.adapt_storage, to, op))
+# Whether `to` has a rule of its own for `op` (not one for any adaptor), which then decides how its children are rebuilt.
+ownAdaptRule(to, op) = Base.unwrap_unionall(which(Adapt.adapt_structure, Tuple{Core.Typeof(to), typeof(op)}).sig).parameters[2] !== Any
+
+function checkAdaptRules(to, op)
+  hasAdaptRule(to, op) || throw(ArgumentError("cannot adapt MapSliceOp: its transformation is or contains an operator of type " *
+                                              "$(typeof(op)) that has no Adapt rule"))
+  ownAdaptRule(to, op) || foreach(child -> checkAdaptRules(to, child), operatorChildren(op))
+end
 
 # A result that still contains an operator of the source would share its workspaces with it.
 function checkRebuilt(moved, trafo, verb)
@@ -98,10 +120,7 @@ end
 
 adaptMapSliceChild(to, trafo::AbstractArray) = adaptRetained(to, trafo, "MapSliceOp transformation")
 function adaptMapSliceChild(to, trafo)
-  for op in operatorTree(trafo)
-    hasAdaptRule(to, op) || throw(ArgumentError("cannot adapt MapSliceOp: its transformation is or contains an operator of type " *
-                                                "$(typeof(op)) that has no Adapt rule"))
-  end
+  checkAdaptRules(to, trafo)
   return checkRebuilt(adapt(to, trafo), trafo, "adapt")
 end
 
